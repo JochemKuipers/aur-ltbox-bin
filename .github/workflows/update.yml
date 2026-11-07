@@ -1,0 +1,94 @@
+name: Update ltbox-bin
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 6 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bump to latest upstream release
+        id: bump
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          sed -i 's/\r$//' update.sh
+          chmod +x update.sh
+          before=$(git status --porcelain)
+          ./update.sh
+          after=$(git status --porcelain)
+          if [[ "$before" != "$after" ]] && [[ -n "$after" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push (GitHub)
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          ver=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          git add PKGBUILD .SRCINFO
+          git commit -m "chore: bump ltbox-bin to ${ver}"
+          git push
+
+      - name: Publish to AUR
+        if: steps.bump.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "${AUR_SSH_PRIVATE_KEY}" ]] || { echo "missing secret AUR_SSH_PRIVATE_KEY" >&2; exit 1; }
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND='ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o BatchMode=yes'
+
+          echo "Running AUR SSH preflight check..."
+          # AUR's SSH forced-command rejects shell builtins like `true`; use `help`.
+          if ! ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o BatchMode=yes aur@aur.archlinux.org help >/dev/null; then
+            echo "AUR SSH preflight failed: remote account/repo access rejected before clone." >&2
+            echo "Verify the AUR account status and package permissions for ltbox-bin." >&2
+            exit 1
+          fi
+
+          aur_dir=$(mktemp -d)
+          if ! clone_err=$(git clone ssh://aur@aur.archlinux.org/ltbox-bin.git "$aur_dir" 2>&1); then
+            echo "Initial AUR clone failed; attempting setup-repo ltbox-bin..." >&2
+            echo "$clone_err" >&2
+            if ! setup_err=$(ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o BatchMode=yes aur@aur.archlinux.org setup-repo ltbox-bin 2>&1); then
+              echo "AUR setup-repo failed; cannot initialize/access ltbox-bin." >&2
+              echo "$setup_err" >&2
+              exit 1
+            fi
+            if ! retry_clone_err=$(git clone ssh://aur@aur.archlinux.org/ltbox-bin.git "$aur_dir" 2>&1); then
+              echo "AUR clone failed after setup-repo; verify account status and ltbox-bin permissions." >&2
+              echo "$retry_clone_err" >&2
+              exit 1
+            fi
+          fi
+
+          cp PKGBUILD .SRCINFO ltbox-bin.install "$aur_dir/"
+          cd "$aur_dir"
+          git config user.name 'Jochem Kuipers'
+          git config user.email 'jochem@kuipers.cc'
+          git add PKGBUILD .SRCINFO ltbox-bin.install
+          if git diff --cached --quiet; then
+            echo "AUR already up to date"
+            exit 0
+          fi
+
+          ver=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          rel=$(sed -n 's/^pkgrel=//p' PKGBUILD)
+          git commit -m "Update to ${ver}-${rel}"
+          git push
